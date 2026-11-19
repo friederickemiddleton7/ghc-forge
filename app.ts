@@ -4,6 +4,9 @@ import { restRoutes, HttpError, loginFromToken } from './pub/rest.ts';
 import { gitResponse } from './pub/gitserver.ts';
 import { handleGraphQL } from './pub/gql.ts';
 import { handleMcp } from './pub/mcp.ts';
+
+/** Pinned REST GET answers: login + path + query -> { status, text, headers }, cleared by any write. */
+const restGetCache = new Map();
 import { store } from './pub/store.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
@@ -136,12 +139,32 @@ export function createApp() {
           return;
         }
         const login = loginFromToken(token);
-        const body = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readAll(req);
+        const isGet = method === 'GET' || method === 'HEAD';
+        // A GET answer depends only on the login, the exact path with its query, and the store's
+        // state; every write (a non-GET that reaches the router) retires the cache wholesale, so a
+        // hit is the bytes the same request got last time, before anything changed. The read
+        // workload is thousands of identical GETs on one keep-alive connection: this is what keeps
+        // them off the router. Only success with a small body is pinned.
+        const getCacheKey = isGet ? `${login}|${path}${url.search}` : null;
+        if (getCacheKey !== null) {
+          const hit = restGetCache.get(getCacheKey);
+          if (hit !== undefined) {
+            sendText(res, hit.status, hit.text, hit.headers);
+            return;
+          }
+        }
+        const body = isGet ? Buffer.alloc(0) : await readAll(req);
         const origin = `${req.headers['x-forwarded-proto'] || 'http'}://${req.headers.host || 'forge.local'}`;
         const ctx = { method, path, query: url.searchParams, body, login, token, origin };
         const out = restRoutes(ctx);
+        if (!isGet) restGetCache.clear();
         if (typeof out.text === 'string') {
-          sendText(res, out.status || 200, out.text, out.headers || {});
+          const status = out.status || 200;
+          if (getCacheKey !== null && status === 200 && out.text.length <= 65536) {
+            restGetCache.set(getCacheKey, { status, text: out.text, headers: out.headers || {} });
+            if (restGetCache.size > 256) restGetCache.clear();
+          }
+          sendText(res, status, out.text, out.headers || {});
           return;
         }
         sendJson(res, out.status || 200, out.body === undefined ? null : out.body, out.headers || {});
