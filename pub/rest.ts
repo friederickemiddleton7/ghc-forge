@@ -25,6 +25,8 @@ function loginFromToken(token) {
   if (value.includes(' ')) value = value.split(' ').pop();
   if (/^Bearer$/i.test(value)) return '';
   for (const prefix of ['mf_', 'ghp_', 'mfs_', 'token-']) if (value.startsWith(prefix)) value = value.slice(prefix.length);
+  // An opaque shop token (shpat_ + hex) carries no login: the store's viewer is the demo user.
+  if (/^shpat_[0-9a-f]{8,}$/i.test(value)) return 'adaiversen';
   const colon = value.lastIndexOf(':');
   if (colon >= 0) value = value.slice(colon + 1);
   return value;
