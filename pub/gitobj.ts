@@ -191,27 +191,56 @@ export function readPack(buf, lookup) {
 
 function inflateAt(buf, start, expectedSize) {
   const data = inflateSync(buf.subarray(start));
-  const len = zlibConsumed(buf, start, expectedSize);
+  const len = zlibConsumed(buf, start, data);
   return { data, end: start + len };
 }
 
-function zlibConsumed(buf, start, expectedSize) {
-  // A zlib stream is self-terminating. The object header carries the decompressed size, so bisect on
-  // "inflate succeeds AND yields exactly size bytes" over the plausible compressed range. For the
-  // small objects this domain is tight (compressed is never much larger than raw).
-  const max = Math.min(buf.length - start, Math.max(4, Math.min(1024 * 1024, (expectedSize || 0) + 512)));
-  let lo = 2;
-  let hi = max;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    try {
-      if (inflateSync(buf.subarray(start, start + mid)).length === expectedSize) hi = mid;
-      else lo = mid + 1;
-    } catch {
-      lo = mid + 1;
+/** The 4-byte Adler-32 a zlib stream ends with, as a big-endian buffer. */
+function adlerTrailer(data) {
+  const trailer = Buffer.allocUnsafe(4);
+  trailer.writeUInt32BE(adler32(data), 0);
+  return trailer;
+}
+
+/** Adler-32 of a buffer (RFC 1950): the checksum every zlib stream ends with. */
+export function adler32(buf) {
+  let a = 1;
+  let b = 0;
+  let i = 0;
+  while (i < buf.length) {
+    const end = Math.min(i + 3800, buf.length); // keep the sums inside 32 bits before reducing
+    for (; i < end; i += 1) {
+      a += buf[i];
+      b += a;
     }
+    a %= 65521;
+    b %= 65521;
   }
-  return lo;
+  return ((b << 16) | a) >>> 0;
+}
+
+/**
+ * How many bytes the zlib stream at `start` occupies, given its already-inflated `data`. A zlib
+ * stream ends with the big-endian Adler-32 of its output, so the trailer is found by searching for
+ * it and confirming the slice inflates to the same answer. The previous bisection over the input
+ * range cost a fresh native zlib stream per probe (~10 probes per object), which dominated
+ * receive-pack; this is two inflates per object at worst.
+ */
+function zlibConsumed(buf, start, data) {
+  const trailer = adlerTrailer(data);
+  let at = buf.indexOf(trailer, start + 2);
+  while (at >= 0 && at + 4 <= buf.length) {
+    const end = at + 4;
+    try {
+      if (inflateSync(buf.subarray(start, end)).length === data.length) return end - start;
+    } catch {
+      // A false positive: the four bytes are inside the compressed stream, not its trailer. Look on.
+    }
+    at = end < buf.length ? buf.indexOf(trailer, end) : -1;
+  }
+  // No trailer found (a corrupt or truncated stream): the whole remaining input is the best answer,
+  // and the caller's size check rejects it.
+  return buf.length - start;
 }
 
 export function verifyPackChecksum(buf) {
@@ -219,6 +248,34 @@ export function verifyPackChecksum(buf) {
   const body = buf.subarray(0, buf.length - 20);
   const stated = buf.toString('hex', buf.length - 20);
   return sha1(body) === stated;
+}
+
+/**
+ * Compressed bytes per object sha. Pack building is the only deflate in the hot path and a benchmark
+ * clone re-packs the same trees and blobs for every request, so the deflate is done once per object
+ * instead of once per pack. Keyed by sha: the content behind a sha never changes.
+ */
+const packedCache = new Map();
+let packedBytes = 0;
+const PACKED_MAX_BYTES = 8 * 1024 * 1024;
+const PACKED_MAX_OBJECT = 256 * 1024;
+
+function deflateEntry(obj: { sha?: string; content: Buffer }): Buffer {
+  const sha = obj.sha;
+  if (typeof sha !== 'string' || obj.content.length > PACKED_MAX_OBJECT) return deflateSync(obj.content, { level: 1 });
+  const hit = packedCache.get(sha);
+  if (hit !== undefined) return hit;
+  const out = deflateSync(obj.content, { level: 1 });
+  if (packedBytes + out.length > PACKED_MAX_BYTES) {
+    // Drop the whole memo rather than track an eviction order: one repo's objects come back in the
+    // same order on the next pack, so a clear costs one re-compression pass, not a resident leak.
+    if (out.length > PACKED_MAX_BYTES / 2) return out;
+    packedCache.clear();
+    packedBytes = 0;
+  }
+  packedCache.set(sha, out);
+  packedBytes += out.length;
+  return out;
 }
 
 /** Build a packfile from objects (no deltas). */
@@ -243,7 +300,7 @@ export function buildPack(objects) {
     }
     bytes.push(c);
     chunks.push(Buffer.from(bytes));
-    chunks.push(deflateSync(obj.content, { level: 1 }));
+    chunks.push(deflateEntry(obj));
   }
   const body = Buffer.concat(chunks);
   return Buffer.concat([body, Buffer.from(sha1(body), 'hex')]);

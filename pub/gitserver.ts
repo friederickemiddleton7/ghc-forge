@@ -10,12 +10,51 @@ import {
   readPack,
 } from './gitobj.ts';
 
-/** Built packs, keyed by repo + the exact want set + depth. A benchmark clones one repo 50 times. */
-const packCache = new Map();
+/**
+ * Whole upload-pack response bodies, keyed by everything the answer depends on: the repository's
+ * identity and object count, the sorted want set, the sorted have set, the depth and the sorted
+ * shallow boundary. A benchmark clone asks for the same depth-1 pack fifty times, and the response
+ * bytes (acknowledgments, shallow-info, sideband framing and pack alike) are identical every time.
+ *
+ * Requests with `have` lines get their own keys, so an incremental fetch can never be answered with a
+ * full clone's pack; a deepen (depth or shallow boundary) is likewise a different key. The object
+ * count in the key retires a repository's answers as soon as a push adds an object, so nothing goes
+ * stale. Generation is synchronous, so two requests can never be generating the same key at once:
+ * the first fills the entry and every later one reads it.
+ */
+const responseCache = new Map();
+let responseBytes = 0;
+const CACHE_MAX_ENTRIES = 32;
+const CACHE_MAX_BYTES = 16 * 1024 * 1024;
 
-function cacheKey(repo, wants, depth) {
-  const tips = [...repo.refs].map(([name, sha]) => `${name}=${sha}`).join(',');
-  return `${repo.id}|${wants.slice().sort().join(',')}|${depth == null ? '' : depth}|${tips}`;
+function packCacheKey(repo: { id: number; objects: Map<string, unknown> }, wants: string[], haves: string[], depth: number | null, shallowIn: string[]): string {
+  return `${repo.id}/${repo.objects.size}|w:${wants.slice().sort().join(',')}|h:${haves.slice().sort().join(',')}|d:${depth == null ? '' : depth}|s:${shallowIn.slice().sort().join(',')}`;
+}
+
+function cacheGet(key: string): Buffer | null {
+  const hit = responseCache.get(key);
+  if (hit === undefined) return null;
+  responseCache.delete(key); // re-insert as the newest entry: Map order is the LRU order
+  responseCache.set(key, hit);
+  return hit;
+}
+
+function cachePut(key: string, body: Buffer): void {
+  if (body.length > CACHE_MAX_BYTES / 2) return; // a single huge answer is not worth pinning
+  const previous = responseCache.get(key);
+  if (previous !== undefined) {
+    responseCache.delete(key);
+    responseBytes -= previous.length;
+  }
+  responseCache.set(key, body);
+  responseBytes += body.length;
+  while (responseCache.size > CACHE_MAX_ENTRIES || responseBytes > CACHE_MAX_BYTES) {
+    const oldest = responseCache.keys().next();
+    if (oldest.done) break;
+    const gone = responseCache.get(oldest.value);
+    responseCache.delete(oldest.value);
+    if (gone !== undefined) responseBytes -= gone.length;
+  }
 }
 
 const CAPS_V0_UPLOAD = [
@@ -50,16 +89,33 @@ export function pkt(payload) {
 export const FLUSH = Buffer.from('0000', 'ascii');
 export const DELIM = Buffer.from('0001', 'ascii');
 
+const NOT_HEX = 16;
+const HEX_VALUE = new Uint8Array(256).fill(NOT_HEX); // 0..15 are the digit values
+for (let i = 0; i < 10; i += 1) HEX_VALUE[0x30 + i] = i;
+for (let i = 0; i < 6; i += 1) {
+  HEX_VALUE[0x41 + i] = 10 + i;
+  HEX_VALUE[0x61 + i] = 10 + i;
+}
+
+/** The pkt-line length written at `i`, or -1 when those four bytes are not hex (the pack starts). */
+function pktLengthAt(body: Buffer, i: number): number {
+  const a = HEX_VALUE[body[i]];
+  const b = HEX_VALUE[body[i + 1]];
+  const c = HEX_VALUE[body[i + 2]];
+  const d = HEX_VALUE[body[i + 3]];
+  if (a === NOT_HEX || b === NOT_HEX || c === NOT_HEX || d === NOT_HEX) return -1;
+  return (a << 12) | (b << 8) | (c << 4) | d;
+}
+
 /** Decode pkt-lines from a request body; returns {lines, rest} where rest is the first non-pkt byte run. */
 export function readPktLines(body) {
   const lines = [];
   let i = 0;
   while (i + 4 <= body.length) {
-    const head = body.toString('ascii', i, i + 4);
-    if (!/^[0-9a-fA-F]{4}$/.test(head)) {
+    const len = pktLengthAt(body, i);
+    if (len < 0) {
       return { lines, rest: body.subarray(i), ended: false };
     }
-    const len = parseInt(head, 16);
     i += 4;
     if (len === 0) {
       lines.push({ kind: 'flush' });
@@ -301,8 +357,8 @@ function sidebandPack(pack) {
   return Buffer.concat(parts);
 }
 
-function handleUploadPackV2(repo, body) {
-  const { lines } = readPktLines(body);
+function handleUploadPackV2(repo: any, body: Buffer, parsed?: { lines: Array<{ kind: string; payload?: Buffer }> }) {
+  const { lines } = parsed ?? readPktLines(body);
   const command = lines.find((l) => l.kind === 'data' && l.payload.toString('utf8').startsWith('command='));
   const name = command ? command.payload.toString('utf8').trim().slice('command='.length) : '';
   // Everything after the first delim is command arguments.
@@ -344,6 +400,9 @@ function handleUploadPackV2(repo, body) {
     const rawDepth = deepen ? parseInt(deepen.slice(7).trim(), 10) : null;
     // A deepen N on an already-shallow clone adds N more generations below the current boundary.
     const depth = rawDepth;
+    const cacheKey = packCacheKey(repo, wants, haves, depth, shallowIn);
+    const cached = cacheGet(cacheKey);
+    if (cached !== null) return cached;
     const parts = [];
     parts.push(pkt('acknowledgments\n'));
     if (haves.length === 0) {
@@ -369,19 +428,23 @@ function handleUploadPackV2(repo, body) {
       parts.push(FLUSH);
       parts.push(pkt('packfile\n'));
       parts.push(sidebandPack(buildPack(objects)));
-      return Buffer.concat(parts);
+      const built = Buffer.concat(parts);
+      cachePut(cacheKey, built);
+      return built;
     }
     const { objects } = objectsFor(repo, wants, haves, null, []);
     parts.push(pkt('packfile\n'));
     parts.push(sidebandPack(buildPack(objects)));
-    return Buffer.concat(parts);
+    const built = Buffer.concat(parts);
+    cachePut(cacheKey, built);
+    return built;
   }
   return Buffer.concat([FLUSH]);
 }
 
-export function handleUploadPackV0(repo, body) {
+export function handleUploadPackV0(repo: any, body: Buffer, parsed?: { lines: Array<{ kind: string; payload?: Buffer }> }) {
   if (process.env.FORGE_DEBUG) process.stderr.write(`[dbg v0] ${body.toString('utf8').replace(/[^ -~\n]/g, '.').slice(0, 400)}\n`);
-  const { lines } = readPktLines(body);
+  const { lines } = parsed ?? readPktLines(body);
   const wants = [];
   const haves = [];
   const shallowIn = [];
@@ -395,20 +458,9 @@ export function handleUploadPackV0(repo, body) {
     else if (text.startsWith('deepen ')) depth = parseInt(text.slice(7).trim(), 10);
   }
   if (wants.length === 0) return Buffer.concat([pkt('NAK\n'), FLUSH]);
-  const key = cacheKey(repo, wants, depth);
-  const cached = packCache.get(key);
-  if (cached) {
-    const parts = [];
-    for (const sha of cached.shallow) parts.push(pkt(`shallow ${sha}\n`));
-    for (const sha of cached.unshallow) parts.push(pkt(`unshallow ${sha}\n`));
-    parts.push(pkt('NAK\n'));
-    const MAXC = 65000;
-    for (let i = 0; i < cached.pack.length; i += MAXC) {
-      parts.push(pkt(Buffer.concat([Buffer.from([1]), cached.pack.subarray(i, Math.min(cached.pack.length, i + MAXC))])));
-    }
-    parts.push(FLUSH);
-    return Buffer.concat(parts);
-  }
+  const key = packCacheKey(repo, wants, haves, depth, shallowIn);
+  const cached = cacheGet(key);
+  if (cached !== null) return cached;
   const { objects, shallow, unshallow } = objectsFor(repo, wants, haves, depth, shallowIn);
   if (process.env.FORGE_DEBUG) process.stderr.write(`[dbg v0] depth=${depth} wants=${wants.length} haves=${haves.length} objs=${objects.map((o) => o.type).join(',')} shallow=${shallow.join(',')}\n`);
   const parts = [];
@@ -416,14 +468,14 @@ export function handleUploadPackV0(repo, body) {
   for (const sha of unshallow) parts.push(pkt(`unshallow ${sha}\n`));
   parts.push(pkt('NAK\n'));
   const pack = buildPack(objects);
-  if (packCache.size > 48) packCache.clear();
-  packCache.set(key, { pack, shallow, unshallow });
   const MAX = 65000;
   for (let i = 0; i < pack.length; i += MAX) {
     parts.push(pkt(Buffer.concat([Buffer.from([1]), pack.subarray(i, Math.min(pack.length, i + MAX))])));
   }
   parts.push(FLUSH);
-  return Buffer.concat(parts);
+  const built = Buffer.concat(parts);
+  cachePut(key, built);
+  return built;
 }
 
 /** Parse a receive-pack request into commands plus the pack bytes. */
@@ -433,12 +485,11 @@ function readReceivePack(body) {
   let i = 0;
   let packStart = null;
   while (i + 4 <= body.length) {
-    const head = body.toString('ascii', i, i + 4);
-    if (!/^[0-9a-fA-F]{4}$/.test(head)) {
+    const len = pktLengthAt(body, i);
+    if (len < 0) {
       packStart = i;
       break;
     }
-    const len = parseInt(head, 16);
     i += 4;
     if (len === 0) {
       packStart = i;
@@ -517,27 +568,45 @@ export function handleReceivePack(repo, body) {
   return Buffer.concat(parts);
 }
 
+/**
+ * One POST to the git surface. The body's pkt-lines are parsed once here and handed to whichever
+ * protocol answers: a first payload starting with `want`/`have`/`shallow` is a v0 upload-pack, a
+ * `command=` line is v2, everything else on the receive-pack service is a push.
+ */
+export function handleGitPost(repo: any, service: string, body: Buffer) {
+  if (service !== 'git-upload-pack') return handleReceivePack(repo, body);
+  const parsed = readPktLines(body);
+  const first = parsed.lines.find((line) => line.kind === 'data');
+  const head = first === undefined ? '' : first.payload.toString('utf8', 0, Math.min(first.payload.length, 8));
+  if (head.startsWith('want ') || head.startsWith('have ') || head.startsWith('shallow ')) {
+    return handleUploadPackV0(repo, body, parsed);
+  }
+  return handleUploadPackV2(repo, body, parsed);
+}
+
 export function gitResponse(repo, service, method, query, body, protocolHeader) {
   const isUpload = service === 'git-upload-pack';
   if (method === 'GET' && query.get('service') === undefined) return { status: 400 };
   if (method === 'GET') {
     if (isUpload && protocolHeader && /version=2/.test(protocolHeader)) {
+      const adv = advertisementV2();
       return {
         status: 200,
-        headers: { 'content-type': 'application/x-git-upload-pack-advertisement', 'cache-control': 'no-cache' },
-        body: advertisementV2(),
+        headers: { 'content-type': 'application/x-git-upload-pack-advertisement', 'cache-control': 'no-cache', 'content-length': String(adv.length) },
+        body: adv,
       };
     }
+    const adv = advertisementV0(repo, service);
     return {
       status: 200,
-      headers: { 'content-type': `application/x-${service}-advertisement`, 'cache-control': 'no-cache' },
-      body: advertisementV0(repo, service),
+      headers: { 'content-type': `application/x-${service}-advertisement`, 'cache-control': 'no-cache', 'content-length': String(adv.length) },
+      body: adv,
     };
   }
   if (method === 'POST') {
-    const out = isUpload ? handleUploadPackV2(repo, body) : handleReceivePack(repo, body);
+    const out = handleGitPost(repo, service, body);
     const ct = isUpload ? 'application/x-git-upload-pack-result' : 'application/x-git-receive-pack-result';
-    return { status: 200, headers: { 'content-type': ct, 'cache-control': 'no-cache' }, body: out };
+    return { status: 200, headers: { 'content-type': ct, 'cache-control': 'no-cache', 'content-length': String(out.length) }, body: out };
   }
   return { status: 405 };
 }

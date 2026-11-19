@@ -1,7 +1,7 @@
 // The entry's HTTP server: one process, its own store, no dependencies.
 import { createServer } from 'node:http';
 import { restRoutes, HttpError, loginFromToken } from './pub/rest.ts';
-import { gitResponse, looksV0, handleUploadPackV0 } from './pub/gitserver.ts';
+import { gitResponse } from './pub/gitserver.ts';
 import { handleGraphQL } from './pub/gql.ts';
 import { handleMcp } from './pub/mcp.ts';
 import { store } from './pub/store.ts';
@@ -44,7 +44,7 @@ function readAll(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     req.on('data', (chunk) => chunks.push(chunk));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => resolve(chunks.length === 1 ? chunks[0] : Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
@@ -101,14 +101,7 @@ export function createApp() {
         }
         const body = await readAll(req);
         const service = isUpload ? 'git-upload-pack' : 'git-receive-pack';
-        const out =
-          isUpload && looksV0(body)
-            ? {
-                status: 200,
-                headers: { 'content-type': 'application/x-git-upload-pack-result', 'cache-control': 'no-cache' },
-                body: handleUploadPackV0(repo, body),
-              }
-            : gitResponse(repo, service, 'POST', url.searchParams, body, req.headers['git-protocol']);
+        const out = gitResponse(repo, service, 'POST', url.searchParams, body, req.headers['git-protocol']);
         res.writeHead(out.status, { 'x-github-request-id': requestId(), ...out.headers });
         res.end(out.body);
         return;
